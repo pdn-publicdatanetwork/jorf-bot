@@ -1,9 +1,10 @@
-// Import des mesures nominatives du JORF dans les tables `ministres` et
-// `cabinets_ministeriels` (mêmes conventions d'identifiants que le pipeline
-// webapp : MIN-<NOM>-<AAAAMMJJ>, CAB-…), suivi dans `jorf_releves`.
+// Import des mesures nominatives du JORF dans les tables \`ministres\` et
+// \`cabinets_ministeriels\` (mêmes conventions d'identifiants que le pipeline
+// webapp : MIN-<NOM>-<AAAAMMJJ>, CAB-…), suivi dans \`jorf_releves\`.
 
 import { cleNom, releverJour } from "./jorf.js";
 import { ecrire, lire, lirePrive, maj } from "./supabase.js";
+import { notifierIndexNow } from "./indexnow.js";
 
 const idMinistre = (nom, date) => `MIN-${nom.toUpperCase().replace(/[^A-Z]/g, "")}-${date.replace(/-/g, "")}`;
 const idCabinet = (ministreId, prenom, nom) => `CAB-${ministreId}-${cleNom(prenom, nom).replace(/ /g, "-").toUpperCase()}`;
@@ -16,7 +17,7 @@ async function chercherParlementaire(prenom, nom) {
 
 async function chercherCollaborateur(prenom, nom) {
   const rows = await lire("collaborateurs", new URLSearchParams({
-    select: "collab_id,collab_prenom,collab_nom", collab_cle: `eq.${cleNom(prenom, nom)}`, limit: "1",
+    select: "collab_id,collab_prenom,collab_nom,collab_cle,slug", collab_cle: `eq.${cleNom(prenom, nom)}`, limit: "1",
   }));
   return rows[0] ?? null;
 }
@@ -92,11 +93,14 @@ const gouvernementDu = (extrait) =>
 // PATCH filtré. Les rapprochements collab_id / personne_id se font ensuite en
 // une passe SQL (scripts/rapprochements.sql).
 // ---------------------------------------------------------------------------
-export async function importerMesuresBrut(date, mesures, ctx) {
+export async function importerMesuresBrut(date, mesures, ctx, notifier = false) {
   const now = new Date().toISOString();
   const out = { date, nb: mesures.length, ministres: 0, cabinets: 0, erreurs: [] };
   const aEcrire = [];
   const dejaEcrits = new Map(); // id cabinet → ligne déjà au lot (dédoublonnage)
+  // Pages du site impactées par ce jour : soumises à IndexNow en fin d'import
+  // (notifier=true en mode quotidien uniquement — jamais en rattrapage corpus).
+  const pages = new Set(["/gouv", "/gouv/explorer", "/daily", `/daily/${date}`]);
   for (const m of mesures) {
     try {
       if (m.role === "ministre") {
@@ -126,6 +130,11 @@ export async function importerMesuresBrut(date, mesures, ctx) {
         if (m.type === "cessation") {
           await maj("cabinets_ministeriels", { fin: m.date, synced_at: now },
             new URLSearchParams({ collab_cle: `eq.${cle}`, fin: "is.null" }));
+          // La fiche du collaborateur (s'il existe dans le référentiel) change aussi.
+          if (notifier) {
+            const c = await chercherCollaborateur(m.prenom, m.nom).catch(() => null);
+            if (c?.slug) pages.add(`/collab/${c.slug}`);
+          }
         } else {
           const id = idCabinet(ministreId, m.prenom, m.nom);
           const existant = aEcrire.find((x) => x.id === id) ?? dejaEcrits.get(id);
@@ -142,6 +151,7 @@ export async function importerMesuresBrut(date, mesures, ctx) {
             // même cabinet déjà écrit dans ce lot ou ce jour : on complète juste fin si cessation ultérieure
             dejaEcrits.set(id, existant);
           }
+          if (notifier) pages.add(`/gouv/m/${ministreId}`); // fiche du ministre (son cabinet a bougé)
         }
         out.cabinets++;
       }
@@ -155,13 +165,15 @@ export async function importerMesuresBrut(date, mesures, ctx) {
     const cles = [...new Set(aEcrire.map((l) => l.collab_cle))].filter(Boolean);
     if (cles.length) {
       const connus = await lire("collaborateurs", new URLSearchParams({
-        select: "collab_id,collab_prenom,collab_nom,collab_cle",
+        select: "collab_id,collab_prenom,collab_nom,collab_cle,slug",
         collab_cle: `in.(${cles.map((c) => `"${c}"`).join(",")})`, limit: "1000",
       })).catch(() => []);
       const parCle = new Map(connus.map((c) => [c.collab_cle, c]));
       for (const l of aEcrire) {
         const c = parCle.get(l.collab_cle);
-        if (c) { l.collab_id = c.collab_id; l.collab_prenom = c.collab_prenom; l.collab_nom = c.collab_nom.toUpperCase(); }
+        if (c) { l.collab_id = c.collab_id; l.collab_prenom = c.collab_prenom; l.collab_nom = c.collab_nom.toUpperCase();
+          if (notifier && c.slug) pages.add(`/collab/${c.slug}`); // nouveau poste visible sur son parcours
+        }
       }
     }
     await ecrire("cabinets_ministeriels", aEcrire);
@@ -171,6 +183,8 @@ export async function importerMesuresBrut(date, mesures, ctx) {
     date_jorf: date, nb_mesures: out.nb, nb_ministres: out.ministres, nb_cabinets: out.cabinets,
     erreurs: out.erreurs.slice(0, 5).join(" | ").slice(0, 500), synced_at: now,
   }]);
+  out.pages = [...pages];
+  if (notifier) await notifierIndexNow(out.pages);
   return out;
 }
 
@@ -183,7 +197,7 @@ export async function importerMesuresBrut(date, mesures, ctx) {
 const ctxJour = { ministres: new Map() };
 export async function importerJour(date) {
   const mesures = await releverJour(date);
-  return importerMesuresBrut(date, mesures, ctxJour);
+  return importerMesuresBrut(date, mesures, ctxJour, true);
 }
 
 export const demain = (date) => new Date(Date.parse(date) + 86_400_000).toISOString().slice(0, 10);
@@ -195,7 +209,7 @@ export async function joursBalayes() {
 }
 
 // Balayage d'une plage de jours, en reprenant là où il s'était arrêté.
-// `forcer` ignore les jours déjà « balayés » (utile après un bug : des jours
+// \`forcer\` ignore les jours déjà « balayés » (utile après un bug : des jours
 // marqués avec 0 mesure alors que le JORF en publiait). Si tout échoue d'emblée
 // (réseau coupé, table absente…), on s'arrête vite avec un message clair
 // au lieu d'attraper des centaines d'erreurs.

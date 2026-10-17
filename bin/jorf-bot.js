@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// jorf-bot — CLI : statut | diagnostique | jour <date> | veille | rattraper | balayer <debut> [fin] | corpus <archive.tar.gz | dossier> <debut> [fin]
+// jorf-bot — CLI : statut | diagnostique | jour <date> | veille | rattraper | balayer <debut> [fin] | corpus <archive.tar.gz | dossier> <debut> [fin] | indexnow <url>...
 // Exemples :
 //   node bin/jorf-bot.js statut
 //   node bin/jorf-bot.js jour 2026-10-03
@@ -8,12 +8,14 @@
 //   node bin/jorf-bot.js balayer 2024-01-01 2024-06-30
 //   node bin/jorf-bot.js balayer 2025-07-14 --forcer   (rattrapage complet, même les jours déjà balayés)
 //   node bin/jorf-bot.js corpus Freemium_jorf_global_20250713-140000.tar.gz 2012-01-01 2025-07-13
+//   node bin/jorf-bot.js indexnow /gouv /collab/jean-dupont-3f2a1b9c   (soumission manuelle)
 
 import { balayer, importerJour, joursBalayes, statut } from "../src/import.js";
 import { importerCorpus } from "../src/corpus.js";
 import { fenetreJorfsimple, releverJour } from "../src/jorf.js";
 import { ecrire, lire, lirePrive, supprimer } from "../src/supabase.js";
 import { verifierEnv } from "../src/supabase.js";
+import { notifierIndexNow } from "../src/indexnow.js";
 
 const ISO = /^\d{4}-\d{2}-\d{2}$/;
 const aujourdhui = (offset = 0) => new Date(Date.now() - offset * 86_400_000).toISOString().slice(0, 10);
@@ -99,6 +101,9 @@ async function main() {
       // Balayage auto-correctif : les 5 derniers jours, en sautant ceux déjà
       // traités (jorf_releves). Un jour manqué (cron silencieux, box éteinte)
       // est repris au passage suivant — jamais de trou dans la base.
+      // Chaque jour importé soumet ses pages à IndexNow (voir import.js) :
+      // /gouv, /daily, la fiche du ministre dont le cabinet a bougé et les
+      // fiches /collab des collaborateurs concernés.
       const hier = aujourdhui(1);
       const r = await balayer(aujourdhui(FENETRE_VEILLE), hier);
       console.log(`${r.jours.length} jour(s) traité(s), ${r.enErreur ?? 0} en erreur.`);
@@ -141,8 +146,16 @@ async function main() {
       console.log(`${r.fichiers} fichier(s) parcouru(s) — ${r.jours} jour(s) importé(s), ${r.mesures} mesure(s) : ${r.ministres} ministre(s), ${r.cabinets} cabinet(s), ${r.erreurs} erreur(s).`);
       break;
     }
+    case "indexnow": {
+      // Soumission manuelle : chemins absolus du site (/gouv, /daily/2026-10-17…)
+      // ou URL complètes. Aucune écriture en base — juste le ping protocole.
+      if (!args.length) { console.error("Usage : jorf-bot indexnow <chemin-ou-url>… (ex. /gouv /daily/2026-10-17)"); process.exit(1); }
+      const r = await notifierIndexNow(args);
+      if (!r.ok) process.exitCode = 1;
+      break;
+    }
     default:
-      console.error("Commandes : statut | diagnostique | jour <date> | veille | rattraper | balayer <debut> [fin] [--forcer] | corpus <archive.tar.gz | dossier> <debut> [fin]");
+      console.error("Commandes : statut | diagnostique | jour <date> | veille | rattraper | balayer <debut> [fin] [--forcer] | corpus <archive.tar.gz | dossier> <debut> [fin] | indexnow <url>…");
       process.exit(1);
   }
 }
