@@ -1,0 +1,14 @@
+== jorf-history 2026-11-09T17:06:32Z (run 42661349047) ==
+== Diagnostique jorf-bot ==
+Date : 2026-11-09T17:06:32.059Z
+DILA index JORFSIMPLE : OK — 1 zips, de 20261108 à 20261108
+  (remarque : au-delà de cette fenêtre, les jours « balayés » reviennent vides)
+DILA zip 2026-11-08 : OK — 2 mesure(s) nominative(s) extraite(s)
+Supabase lecture publique : OK (1 ligne(s) lue(s))
+jorf_releves lecture : OK (5 ligne(s))
+jorf_releves écriture + suppression : OK
+== Statut avant balayage ==
+Jours balayés : 4440 (de 2012-01-01 à 2026-11-08)
+Prochaine étape : 2017-01-02 (605 jours restants)
+Jours balayés : 4440 (de 2012-01-01 à 2026-11-08)
+Prochaine étape : 2017-01-02 (605 jours restants)
