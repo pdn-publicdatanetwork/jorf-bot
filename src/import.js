@@ -1,6 +1,6 @@
-// Import des mesures nominatives du JORF dans les tables \`ministres\` et
-// \`cabinets_ministeriels\` (mêmes conventions d'identifiants que le pipeline
-// webapp : MIN-<NOM>-<AAAAMMJJ>, CAB-…), suivi dans \`jorf_releves\`.
+// Import des mesures nominatives du JORF dans les tables `ministres` et
+// `cabinets_ministeriels` (mêmes conventions d'identifiants que le pipeline
+// webapp : MIN-<NOM>-<AAAAMMJJ>, CAB-…), suivi dans `jorf_releves`.
 
 import { cleNom, releverJour } from "./jorf.js";
 import { ecrire, lire, lirePrive, maj } from "./supabase.js";
@@ -204,12 +204,24 @@ export const demain = (date) => new Date(Date.parse(date) + 86_400_000).toISOStr
 
 export async function joursBalayes() {
   // jorf_releves n'est pas en lecture publique : clé service_role obligatoire.
-  const rows = await lirePrive("jorf_releves", new URLSearchParams({ select: "date_jorf", limit: "10000" }));
-  return new Set(rows.map((x) => x.date_jorf));
+  // ATTENTION : PostgREST (Supabase) plafonne TOUTE requête à 1000 lignes —
+  // un simple limit=10000 ne suffit pas (vérifié : 4440 lignes en base, 1000
+  // renvoyées). Sans pagination, seuls les 1000 premiers jours (les plus
+  // anciens) sont « vus » et la veille échoue chaque matin (« Veille
+  // incomplète ») alors que le balayage a réussi. D'où la pagination par
+  // tranche de 1000 avec ordre explicite (prérequis d'un offset stable).
+  const vus = new Set();
+  for (let offset = 0; ; offset += 1000) {
+    const rows = await lirePrive("jorf_releves", new URLSearchParams({
+      select: "date_jorf", order: "date_jorf.asc", limit: "1000", offset: String(offset),
+    }));
+    for (const x of rows) vus.add(x.date_jorf);
+    if (rows.length < 1000) return vus;
+  }
 }
 
 // Balayage d'une plage de jours, en reprenant là où il s'était arrêté.
-// \`forcer\` ignore les jours déjà « balayés » (utile après un bug : des jours
+// `forcer` ignore les jours déjà « balayés » (utile après un bug : des jours
 // marqués avec 0 mesure alors que le JORF en publiait). Si tout échoue d'emblée
 // (réseau coupé, table absente…), on s'arrête vite avec un message clair
 // au lieu d'attraper des centaines d'erreurs.
@@ -242,11 +254,13 @@ export async function balayer(debut, fin, verbeux = true, forcer = false) {
 
 // Statut : jours balayés, prochaine étape.
 export async function statut() {
-  const rows = await lirePrive("jorf_releves", new URLSearchParams({ select: "date_jorf", order: "date_jorf", limit: "5000" }))
-    .catch(() => []);
-  const vus = new Set(rows.map((x) => x.date_jorf));
+  // Même pagination que joursBalayes (le plafond PostgREST de 1000 lignes
+  // faussait déjà le décompte : scan.jours, prochain et restants).
+  const vus = await joursBalayes().catch(() => new Set());
+  const premiere = (await lirePrive("jorf_releves", new URLSearchParams({ select: "date_jorf", order: "date_jorf.asc", limit: "1" })).catch(() => []))[0]?.date_jorf ?? null;
+  const derniere = (await lirePrive("jorf_releves", new URLSearchParams({ select: "date_jorf", order: "date_jorf.desc", limit: "1" })).catch(() => []))[0]?.date_jorf ?? null;
   const hier = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
   let d = "2017-01-01", prochain = null, restants = 0;
   while (d <= hier) { if (!vus.has(d)) { if (!prochain) prochain = d; restants++; } d = demain(d); }
-  return { scan: { jours: vus.size, premiere: rows[0]?.date_jorf ?? null, derniere: rows[rows.length - 1]?.date_jorf ?? null }, prochain, restants };
+  return { scan: { jours: vus.size, premiere, derniere }, prochain, restants };
 }
