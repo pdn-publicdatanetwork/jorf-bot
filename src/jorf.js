@@ -1,7 +1,10 @@
 // Balayage du Journal officiel (JORF, edition « Lois et decrets ») :
 // téléchargement des dumps quotidiens de la DILA (JORFSIMPLE), extraction des
 // mesures nominatives qui concernent le gouvernement (ministres) et les
-// cabinets ministériels (directeurs, chefs de cabinet, conseillers…).
+// cabinets ministériels (directeurs, chefs de cabinet, conseillers…), et
+// des rubriques « Informations parlementaires » (composition de l'Assemblée
+// et du Sénat : décès, remplacements, élections, démissions, nominations au
+// Gouvernement — journal brut pour la réconciliation côté collaborateurs).
 // Portage 1:1 de webapp/lib/jorf.ts — zéro dépendance, Node natif.
 // Source : dumps JORFSIMPLE de la DILA (Premier ministre / data.gouv.fr,
 // réutilisation libre).
@@ -316,13 +319,67 @@ export function analyserTexteSimple(xml, dateJour) {
   });
 }
 
-// Télécharge le JORF d'un jour et rend ses mesures nominatives. Depuis le
-// 13/07/2025 : dernier dump JORFSIMPLE_<date>-<heure>.tar.gz du jour. La DILA
-// coupe parfois les connexions : trois essais avec pauses croissantes.
-export async function releverJour(date) {
-  const fichiers = await fichiersJour(date);
-  if (!fichiers.length) return []; // pas de publication ce jour-là (ou hors fenêtre)
-  const url = `${BASE}/${fichiers[fichiers.length - 1]}`;
+// ---------------------------------------------------------------------------
+// 2quater : rubriques « Informations parlementaires » (nature DILA
+// INFORMATIONS_PARLEMENTAIRES ; INFORMATIONS_DIVERSES admise pour
+// l'historique) : composition de l'Assemblée nationale / du Sénat — décès et
+// remplacement d'un parlementaire, élections, démissions, nominations au
+// Gouvernement, groupes politiques… Le contenu est en prose dans
+// BLOC_TEXTUEL : le bot journalise le texte intégral + une classification
+// grossière (evenement). L'interprétation fine (qui remplace qui, quelle
+// date mandater) se fait côté collaborateurs (collabs/parlementaires_reco.py
+// → suppleances.csv) : le bot ne tranche jamais seul.
+// ---------------------------------------------------------------------------
+const CHAMBRES_INFO = [
+  ["assemblee", /assemblée nationale/i],
+  ["senat", /sénat/i],
+  ["parlement_europeen", /parlement européen/i],
+];
+const EVENEMENTS_INFO = [
+  ["deces_remplacement", /décès et remplacement|tristesse de faire part du décès[\s\S]{0,400}remplacé/i],
+  ["deces", /\bdécès\b|est décédé/i],
+  ["demission", /démission/i],
+  ["nomination_gouvernement", /nommé(?:e)? (?:au gouvernement|au Gouvernement|membre du Gouvernement|ministre)/i],
+  ["election", /élection|est élu|élue le|législative partielle|partielle/i],
+  ["composition", /composition de l'| composition du/i],
+  ["nominations", /nominations? et avis/i],
+];
+
+export function analyserInfosParlementaires(xml, dateJour) {
+  const out = [];
+  const nature = (balise(xml, "NATURE") ?? "").trim();
+  if (!/^informations?_(parlementaires|diverses)$/i.test(nature)) return out;
+  const datePubli = balise(xml, "DATE_PUBLI")?.trim() ?? "";
+  // Même garde que analyserTexteSimple : le dump du soir embarque aussi des
+  // textes rectifiés parfois anciens — on retient les textes publiés depuis
+  // deux jours (jours fériés/dimanche décalent l'édition), écriture
+  // idempotente sur l'id du texte.
+  const laVeille = (iso, n) => new Date(Date.parse(iso) - n * 86_400_000).toISOString().slice(0, 10);
+  if (dateJour && datePubli && (datePubli < laVeille(dateJour, 2) || datePubli > dateJour)) return out;
+  const date = dateJour || datePubli;
+  if (!date) return out;
+  const id = balise(xml, "ID");
+  if (!id) return out;
+  const contenu = [...xml.matchAll(/<BLOC_TEXTUEL\b[^>]*>([\s\S]*?)<\/BLOC_TEXTUEL>/gi)]
+    .map((m) => sansBalises(m[1])).join(" ").replace(/\s+/g, " ").trim();
+  if (!contenu) return out;
+  const chambre = CHAMBRES_INFO.find(([, re]) => re.test(contenu))?.[0] ?? "";
+  const evenement = EVENEMENTS_INFO.find(([, re]) => re.test(contenu))?.[0] ?? "autre";
+  out.push({
+    id, date_jorf: date, nature: nature.toUpperCase(),
+    titre: sansBalises(balise(xml, "TITRE") ?? ""),
+    objet: sansBalises(balise(xml, "TITREFULL") ?? ""),
+    chambre, evenement,
+    contenu: contenu.slice(0, 4000),
+    confiance: "officiel",
+  });
+  return out;
+}
+
+// Téléchargement d'un dump JORFSIMPLE, trois essais avec pauses croissantes
+// (la DILA coupe parfois les connexions). Rend null si absent (404 : retiré
+// de la fenêtre glissante entre-temps), une erreur sinon.
+async function telechargerDump(url, date) {
   let r = null;
   let derniereErreur = null;
   for (let essai = 0; essai < 3; essai += 1) {
@@ -335,12 +392,49 @@ export async function releverJour(date) {
       await new Promise((ok) => setTimeout(ok, 2000 * (essai + 1)));
     }
   }
-  if (!r) throw new Error(`JORF ${date} : inaccessible (${derniereErreur?.message ?? "réseau"})`);
-  if (r.status === 404) return []; // retiré de la fenêtre glissante entre-temps
-  if (!r.ok) throw new Error(`JORF ${date} : HTTP ${r.status}`);
+  if (!r) throw new Error(`JORF ${date} : dump inaccessible (${derniereErreur?.message ?? "réseau"})`);
+  if (r.status === 404) return null; // retiré de la fenêtre glissante entre-temps
+  if (!r.ok) throw new Error(`JORF ${date} : HTTP ${r.status} (${url})`);
   const brut = Buffer.from(await r.arrayBuffer());
-  if (brut.length > 80_000_000) throw new Error(`JORF ${date} : tar.gz trop volumineux`);
-  return xmlDuTarGz(brut).flatMap((x) => analyserTexteSimple(x, date));
+  if (brut.length > 80_000_000) throw new Error(`JORF ${date} : tar.gz trop volumineux (${url})`);
+  return brut;
+}
+
+// Un jour du JORF, complet : mesures nominatives + rubriques
+// « Informations parlementaires ». ⚀ TOUTES les éditions du jour sont
+// balayées, pas seulement celle du soir : vérifié sur le terrain
+// (2026-11-21), le dump du soir N'EMBARQUE PAS les
+// INFORMATIONS_PARLEMENTAIRES de l'édition du matin — « Composition de
+// l'Assemblée » (décès/remplacement du 21/11/2026) n'était que dans le dump
+// 01h09. Les écritures étant idempotentes (upsert sur id), recouvrir matin +
+// soir ne crée aucun doublon ; un texte rectifié dans la soirée écrase juste
+// la version du matin. Rend { mesures, infos }.
+export async function releverJourComplet(date) {
+  const fichiers = await fichiersJour(date);
+  if (!fichiers.length) return { mesures: [], infos: [] }; // pas de publication ce jour-là (ou hors fenêtre)
+  const mesures = [];
+  const infos = [];
+  const vusM = new Set();
+  const vusI = new Set();
+  for (const nom of fichiers) {
+    const brut = await telechargerDump(`${BASE}/${nom}`, date);
+    if (!brut) continue;
+    for (const x of xmlDuTarGz(brut)) {
+      for (const m of analyserTexteSimple(x, date)) {
+        const k = `${m.id_texte}|${cleNom(m.prenom, m.nom)}|${m.type}|${m.role}`;
+        if (!vusM.has(k)) { vusM.add(k); mesures.push(m); }
+      }
+      for (const i of analyserInfosParlementaires(x, date)) {
+        if (!vusI.has(i.id)) { vusI.add(i.id); infos.push(i); }
+      }
+    }
+  }
+  return { mesures, infos };
+}
+
+// Compat : les mesures nominatives seules (diagnostique CLI, tests).
+export async function releverJour(date) {
+  return (await releverJourComplet(date)).mesures;
 }
 
 // ---------------------------------------------------------------------------
