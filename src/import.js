@@ -1,11 +1,13 @@
 // Import des mesures nominatives du JORF dans les tables `cabinets_ministeriels`
-// (mêmes conventions d'identifiants que le pipeline webapp : CAB-…), journal
-// machine `jorf_mesures_ministres` des mesures « ministre » (relues par la
-// réconciliation quotidienne du CSV gouvernement, côté repo collaborateurs),
-// suivi dans `jorf_releves`. La table `ministres` curatée, elle, reste tenue
-// par le CSV gouvernement.
+// (mêmes conventions d'identifiants que le pipeline webapp : CAB-…), journaux
+// machines `jorf_mesures_ministres` (mesures « ministre ») et
+// `jorf_infos_parlementaires` (rubriques « Informations parlementaires » :
+// composition de l'Assemblée/Sénat, décès/remplacements, élections…), tous
+// deux relus par la réconciliation quotidienne du CSV gouvernement, côté repo
+// collaborateurs), suivi dans `jorf_releves`. La table `ministres` curatée,
+// elle, reste tenue par le CSV gouvernement.
 
-import { cleNom, releverJour } from "./jorf.js";
+import { cleNom, releverJourComplet } from "./jorf.js";
 import { ecrire, lire, lirePrive, maj } from "./supabase.js";
 import { notifierIndexNow } from "./indexnow.js";
 
@@ -88,8 +90,9 @@ const gouvernementDu = (extrait) =>
   /gouvernement\s+([A-ZÉÈ][a-zéè]+(?:\s+[IV]+)?)/.exec(extrait)?.[1] ?? "";
 
 // ---------------------------------------------------------------------------
-// Mode corpus (import en masse d'un jour) : écrit cabinets_ministeriels et le
-// journal `jorf_mesures_ministres`. La table `ministres` curatée n'est PAS
+// Mode corpus (import en masse d'un jour) : écrit cabinets_ministeriels, le
+// journal `jorf_mesures_ministres` et, le cas échéant (veille quotidienne),
+// `jorf_infos_parlementaires` (rubriques « Informations parlementaires »). La table `ministres` curatée n'est PAS
 // écrite ici (elle est tenue par le CSV gouvernement, repo collaborateurs) :
 // les mesures « ministre » servent à tenir le cache des mandats (ctx) pour
 // rattacher chaque cabinet au bon mandat — cache d'abord, puis une recherche
@@ -100,7 +103,7 @@ const gouvernementDu = (extrait) =>
 // cessations par PATCH filtré. Les rapprochements collab_id / personne_id se
 // font ensuite en une passe SQL (scripts/rapprochements.sql).
 // ---------------------------------------------------------------------------
-export async function importerMesuresBrut(date, mesures, ctx, notifier = false) {
+export async function importerMesuresBrut(date, mesures, ctx, notifier = false, infos = []) {
   const now = new Date().toISOString();
   const out = { date, nb: mesures.length, ministres: 0, cabinets: 0, erreurs: [] };
   const aEcrire = [];
@@ -209,6 +212,16 @@ export async function importerMesuresBrut(date, mesures, ctx, notifier = false) 
       out.erreurs.push(`${aMinistres.length} mesure(s) ministre : journal inaccessible (${e.message})`);
     }
   }
+  if (infos.length) {
+    // Journal des rubriques « Informations parlementaires », même politique :
+    // texte intégral tel que publié, idempotent sur l'id du texte (JORFTEXT).
+    // La mise au propre (suppleances.csv) se fait côté collaborateurs.
+    try {
+      await ecrire("jorf_infos_parlementaires", infos.map((i) => ({ ...i, synced_at: now })));
+    } catch (e) {
+      out.erreurs.push(`${infos.length} info(s) parlementaire(s) : journal inaccessible (${e.message})`);
+    }
+  }
   await ecrire("jorf_releves", [{
     date_jorf: date, nb_mesures: out.nb, nb_ministres: out.ministres, nb_cabinets: out.cabinets,
     erreurs: out.erreurs.slice(0, 5).join(" | ").slice(0, 500), synced_at: now,
@@ -218,16 +231,19 @@ export async function importerMesuresBrut(date, mesures, ctx, notifier = false) 
   return out;
 }
 
-// Un jour du JORF : relève puis import via la même logique que le corpus
-// (importerMesuresBrut). Politique d'écriture : cabinets_ministeriels + le
-// journal jorf_mesures_ministres ; la table ministres reste tenue par le CSV
-// gouvernement (réconciliation quotidienne côté collaborateurs) et les
-// rapprochements collab_id se font inline. Les mesures « ministre » servent
-// de cache de rattachement ET alimenteront la réconciliation du lendemain.
+// Un jour du JORF : relève (toutes les éditions du jour : le dump du soir
+// n'embarque pas les « Informations parlementaires » de l'édition du matin)
+// puis import via la même logique que le corpus (importerMesuresBrut).
+// Politique d'écriture : cabinets_ministeriels + les journaux
+// jorf_mesures_ministres / jorf_infos_parlementaires ; la table ministres
+// reste tenue par le CSV gouvernement (réconciliation quotidienne côté
+// collaborateurs) et les rapprochements collab_id se font inline. Les
+// mesures « ministre » servent de cache de rattachement ET alimenteront la
+// réconciliation du lendemain.
 const ctxJour = { ministres: new Map() };
 export async function importerJour(date) {
-  const mesures = await releverJour(date);
-  return importerMesuresBrut(date, mesures, ctxJour, true);
+  const { mesures, infos } = await releverJourComplet(date);
+  return importerMesuresBrut(date, mesures, ctxJour, true, infos);
 }
 
 export const demain = (date) => new Date(Date.parse(date) + 86_400_000).toISOString().slice(0, 10);
