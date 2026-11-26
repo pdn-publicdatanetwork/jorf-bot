@@ -35,12 +35,15 @@ jobs:
       - name: Télécharger l'archive depuis la Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
         run: |
           # gh release download [<tag>] : sans tag = release la plus récente
-          if [ -n "${{ inputs.release }}" ]; then
-            gh release download "${{ inputs.release }}" --repo "${{ github.repository }}" --pattern "Freemium_jorf_global_*.tar*"
+          # Les entrées manuelles passent par env, jamais par interpolation
+          # directe dans run (durcissement, audit du 26/11).
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "Freemium_jorf_global_*.tar*"
           else
-            gh release download --repo "${{ github.repository }}" --pattern "Freemium_jorf_global_*.tar*"
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern "Freemium_jorf_global_*.tar*"
           fi
           ls -lh Freemium_jorf_global_*.tar*
       - name: Échantillons (extraits vers la branche logs pour analyse hors CI)
@@ -69,8 +72,10 @@ jobs:
           DATA_SUPABASE_URL: ${{ secrets.DATA_SUPABASE_URL }}
           DATA_SUPABASE_KEY: ${{ secrets.DATA_SUPABASE_KEY }}
           DATA_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.DATA_SUPABASE_SERVICE_ROLE_KEY }}
+          DEBUT: ${{ inputs.debut }}
+          FIN: ${{ inputs.fin }}
         run: |
-          node bin/jorf-bot.js corpus Freemium_jorf_global_*.tar* "${{ inputs.debut }}" "${{ inputs.fin }}" 2>&1 | tee -a corpus.log
+          node bin/jorf-bot.js corpus Freemium_jorf_global_*.tar* "$DEBUT" "$FIN" 2>&1 | tee -a corpus.log
       - name: Publier le journal sur la branche logs
         if: always()
         run: |

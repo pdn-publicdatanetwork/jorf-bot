@@ -52,8 +52,14 @@ jobs:
           DATA_SUPABASE_URL: ${{ secrets.DATA_SUPABASE_URL }}
           DATA_SUPABASE_KEY: ${{ secrets.DATA_SUPABASE_KEY }}
           DATA_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.DATA_SUPABASE_SERVICE_ROLE_KEY }}
+          DATE_DEBUT: ${{ inputs.date_debut }}
+          DATE_FIN: ${{ inputs.date_fin }}
+          FORCER: ${{ inputs.forcer }}
         run: |
-          node bin/jorf-bot.js balayer "${{ inputs.date_debut }}" ${{ inputs.date_fin && format('"{0}"', inputs.date_fin) || '' }} ${{ inputs.forcer && '--forcer' || '' }} 2>&1 | tee balayage.log
+          args=("$DATE_DEBUT")
+          if [ -n "$DATE_FIN" ]; then args+=("$DATE_FIN"); fi
+          if [ "$FORCER" = "true" ]; then args+=("--forcer"); fi
+          node bin/jorf-bot.js balayer "${args[@]}" 2>&1 | tee balayage.log
       - name: Statut après balayage
         if: always()
         env:
